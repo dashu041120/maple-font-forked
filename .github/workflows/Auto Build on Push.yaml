@@ -26,11 +26,14 @@ jobs:
         run: |
           pip install -r requirements.txt
           
-          # 自动检测配置中是否启用了 font-patcher，如果启用了则安装 FontForge
-          # 移除了对 inputs 的判断，完全依赖 config.json 的检测结果
+          echo "Installing system build tools..."
+          sudo apt update -y -q
+          # [修复 1] 安装 7zip (构建脚本常用于打包) 和 ttfautohint (日志显示你需要它)
+          sudo apt install -y -q p7zip-full ttfautohint
+          
+          # 仍然保留 FontForge 检查逻辑
           if python build.py --dry | jq -e '.nerd_font.use_font_patcher == true' >/dev/null; then
-            echo "Font Patcher enabled in config, installing dependencies..."
-            sudo apt update -y -q
+            echo "Font Patcher enabled, installing FontForge..."
             sudo apt install software-properties-common -y -q
             sudo apt install python3-fontforge -y -q
             sudo apt install fuse -y -q
@@ -40,35 +43,62 @@ jobs:
             echo "PATH=$PATH" >> $GITHUB_ENV
           fi
 
-          # 安装 NFPM 用于打包 (deb, rpm, arch)
-          echo "Installing NFPM..."
+          # 安装 NFPM 用于打包 Linux 包
           mkdir -p bin
           curl -sfL https://install.goreleaser.com/github.com/goreleaser/nfpm.sh | sh -s -- -b ./bin
 
       - name: Run Build and Package
         run: |
           # 1. 运行构建
-          # 不带任何特定参数，默认使用 config.json，仅添加 --archive 以生成 zip
-          echo "Building with default config.json..."
+          echo "Starting build process..."
           python build.py --archive
 
-          # 2. 后处理：为 Linux/Nix 打包
+          # [修复 2] 调试：列出所有生成的文件，看看它们到底在哪
+          echo "=== DEBUG: Listing fonts directory ==="
+          ls -R fonts/ || echo "fonts directory not found"
+          echo "======================================"
+
+          # 2. 准备打包环境
           VERSION=$(date +'%Y.%m.%d')
           echo "Using Version: $VERSION"
-
           mkdir -p package_staging
-          # 解压 build.py 生成的 zip 文件
-          unzip -q fonts/archive/*.zip -d package_staging/
+
+          # [修复 3] 使用 find 查找 zip 文件，比 *.zip 更安全
+          # 如果找不到任何 zip，这里会报错并打印明确信息，而不是 cryptic 的 exit code 11
+          ZIP_FILES=$(find fonts/archive -name "*.zip")
           
-          # 获取内部目录名称
+          if [ -z "$ZIP_FILES" ]; then
+            echo "Error: No zip files found in fonts/archive!"
+            echo "Please check the 'DEBUG' log above to see if files were generated elsewhere."
+            exit 1
+          fi
+
+          echo "Found zip files: $ZIP_FILES"
+          # 解压所有找到的 zip
+          for zip in $ZIP_FILES; do
+            unzip -q -o "$zip" -d package_staging/
+          done
+          
+          # 获取解压后的内部目录名称
           cd package_staging
-          DIR_NAME=$(ls -d */ | head -n 1 | tr -d /)
-          echo "Inner directory found: $DIR_NAME"
+          # 有时候解压出来直接是文件，有时候是文件夹，这里做一个判断
+          if [ "$(ls -d */ 2>/dev/null)" ]; then
+            DIR_NAME=$(ls -d */ | head -n 1 | tr -d /)
+            echo "Inner directory found: $DIR_NAME"
+            SRC_PATH="./package_staging/$DIR_NAME"
+          else
+             echo "Files are in root of staging, using current dir"
+             SRC_PATH="./package_staging"
+             DIR_NAME="maple-mono"
+          fi
           
-          # [Target 1] 创建 .tar.gz (Nix 常用)
-          tar -czvf ../maple-mono.tar.gz "$DIR_NAME"
+          # [Target 1] 创建 .tar.gz
+          # 注意：如果在子目录，我们要打包那个子目录；如果是散落文件，我们可能需要调整
+          # 这里假设通常会有一个文件夹
+          tar -czvf ../maple-mono.tar.gz *
           
           # [Target 2,3,4] 使用 NFPM 创建 Deb, RPM, Arch 包
+          # 动态生成配置文件
           cat << EOF > ../nfpm.yaml
           name: "maple-mono"
           arch: "all"
@@ -81,9 +111,9 @@ jobs:
           vendor: "Maple Mono"
           license: "OFL-1.1"
           contents:
-          - src: "./package_staging/$DIR_NAME/*.ttf"
+          - src: "${SRC_PATH}/*.ttf"
             dst: "/usr/share/fonts/truetype/maple-mono/"
-          - src: "./package_staging/$DIR_NAME/LICENSE.txt"
+          - src: "${SRC_PATH}/LICENSE*"
             dst: "/usr/share/doc/maple-mono/LICENSE"
           EOF
           
@@ -94,10 +124,10 @@ jobs:
           ./bin/nfpm pkg --packager rpm --target fonts/archive/MapleMono-${VERSION}.rpm
           ./bin/nfpm pkg --packager arch --target fonts/archive/MapleMono-${VERSION}.pkg.tar.zst
           
-          # 移动 tar.gz 到输出目录
+          # 移动 tar.gz
           mv maple-mono.tar.gz fonts/archive/MapleMono-${VERSION}.tar.gz
           
-          # 清理临时文件
+          # 清理
           rm -rf package_staging nfpm.yaml bin
 
       - id: check_issue
@@ -117,15 +147,14 @@ jobs:
           path: fonts/issue.fea
 
       - name: Create release
-        # 注意：每次 Push 都会创建一个 Release，可能会产生很多 Release 版本
-        # 如果只想在 Push 时保留 Artifact 而不发布 Release，可以删除此步骤
-        if: github.event_name == 'push' 
+        if: github.event_name == 'push'
         run: |
-          if [ ! -d "fonts/archive" ]; then
-            echo "Error: Failed to build font."
-            exit 1
+          # 再次检查是否有文件
+          if [ -z "$(ls -A fonts/archive)" ]; then
+             echo "Error: fonts/archive is empty. Build failed."
+             exit 1
           fi
-          
+
           echo "### Build Info" >> NOTES
           echo "Auto-built from commit: $GITHUB_SHA" >> NOTES
           echo "\`\`\`" >> NOTES
