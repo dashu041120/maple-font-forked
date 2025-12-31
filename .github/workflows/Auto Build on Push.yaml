@@ -1,0 +1,137 @@
+name: Auto Build on Push
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  auto-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: './requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          
+          # 自动检测配置中是否启用了 font-patcher，如果启用了则安装 FontForge
+          # 移除了对 inputs 的判断，完全依赖 config.json 的检测结果
+          if python build.py --dry | jq -e '.nerd_font.use_font_patcher == true' >/dev/null; then
+            echo "Font Patcher enabled in config, installing dependencies..."
+            sudo apt update -y -q
+            sudo apt install software-properties-common -y -q
+            sudo apt install python3-fontforge -y -q
+            sudo apt install fuse -y -q
+            curl -L "https://github.com/fontforge/fontforge/releases/download/20230101/FontForge-2023-01-01-a1dad3e-x86_64.AppImage" --output fontforge
+            chmod u+x fontforge
+            export PATH=`pwd`:$PATH
+            echo "PATH=$PATH" >> $GITHUB_ENV
+          fi
+
+          # 安装 NFPM 用于打包 (deb, rpm, arch)
+          echo "Installing NFPM..."
+          mkdir -p bin
+          curl -sfL https://install.goreleaser.com/github.com/goreleaser/nfpm.sh | sh -s -- -b ./bin
+
+      - name: Run Build and Package
+        run: |
+          # 1. 运行构建
+          # 不带任何特定参数，默认使用 config.json，仅添加 --archive 以生成 zip
+          echo "Building with default config.json..."
+          python build.py --archive
+
+          # 2. 后处理：为 Linux/Nix 打包
+          VERSION=$(date +'%Y.%m.%d')
+          echo "Using Version: $VERSION"
+
+          mkdir -p package_staging
+          # 解压 build.py 生成的 zip 文件
+          unzip -q fonts/archive/*.zip -d package_staging/
+          
+          # 获取内部目录名称
+          cd package_staging
+          DIR_NAME=$(ls -d */ | head -n 1 | tr -d /)
+          echo "Inner directory found: $DIR_NAME"
+          
+          # [Target 1] 创建 .tar.gz (Nix 常用)
+          tar -czvf ../maple-mono.tar.gz "$DIR_NAME"
+          
+          # [Target 2,3,4] 使用 NFPM 创建 Deb, RPM, Arch 包
+          cat << EOF > ../nfpm.yaml
+          name: "maple-mono"
+          arch: "all"
+          platform: "linux"
+          version: "${VERSION}"
+          section: "fonts"
+          priority: "optional"
+          maintainer: "GitHub Action <action@github.com>"
+          description: "Maple Mono Font (Auto Build)"
+          vendor: "Maple Mono"
+          license: "OFL-1.1"
+          contents:
+          - src: "./package_staging/$DIR_NAME/*.ttf"
+            dst: "/usr/share/fonts/truetype/maple-mono/"
+          - src: "./package_staging/$DIR_NAME/LICENSE.txt"
+            dst: "/usr/share/doc/maple-mono/LICENSE"
+          EOF
+          
+          cd ..
+          
+          # 执行打包
+          ./bin/nfpm pkg --packager deb --target fonts/archive/MapleMono-${VERSION}.deb
+          ./bin/nfpm pkg --packager rpm --target fonts/archive/MapleMono-${VERSION}.rpm
+          ./bin/nfpm pkg --packager arch --target fonts/archive/MapleMono-${VERSION}.pkg.tar.zst
+          
+          # 移动 tar.gz 到输出目录
+          mv maple-mono.tar.gz fonts/archive/MapleMono-${VERSION}.tar.gz
+          
+          # 清理临时文件
+          rm -rf package_staging nfpm.yaml bin
+
+      - id: check_issue
+        name: Check issue feature file
+        run: |
+          if [ -f fonts/issue.fea ]; then
+            echo 'exists=true' >> $GITHUB_OUTPUT
+          else
+            echo 'exists=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload issue artifact
+        if: ${{ steps.check_issue.outputs.exists == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-fea-file
+          path: fonts/issue.fea
+
+      - name: Create release
+        # 注意：每次 Push 都会创建一个 Release，可能会产生很多 Release 版本
+        # 如果只想在 Push 时保留 Artifact 而不发布 Release，可以删除此步骤
+        if: github.event_name == 'push' 
+        run: |
+          if [ ! -d "fonts/archive" ]; then
+            echo "Error: Failed to build font."
+            exit 1
+          fi
+          
+          echo "### Build Info" >> NOTES
+          echo "Auto-built from commit: $GITHUB_SHA" >> NOTES
+          echo "\`\`\`" >> NOTES
+          (python build.py --dry | sed '1s/^/font_config: /') || echo "Config dump failed" >> NOTES
+          echo "\`\`\`" >> NOTES
+          
+          gh release create "auto-$(date +%s)" fonts/archive/*.* --notes-file NOTES
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
